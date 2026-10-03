@@ -111,6 +111,32 @@ class ReservationNotReschedulableError(ApiError):
     code = "reservation_not_reschedulable"
 
 
+class AttendanceWindowClosedError(ApiError):
+    """Check-in/check-out is requested outside the attendance time window."""
+
+    status_code = 409
+    code = "attendance_window_closed"
+
+
+class ReservationAttendanceConflictError(ApiError):
+    """The attendance state does not permit the requested operation.
+
+    First check-out without a prior check-in, check-in/check-out of a
+    cancelled reservation, or a reschedule/reassign of a reservation whose
+    visitor has already arrived.
+    """
+
+    status_code = 409
+    code = "reservation_attendance_conflict"
+
+
+class LockNotConfirmedError(ApiError):
+    """The requested number is an unconfirmed slot lock, not a reservation."""
+
+    status_code = 409
+    code = "lock_not_confirmed"
+
+
 class InvalidRequestError(ApiError):
     """The request is structurally valid JSON but semantically unacceptable."""
 

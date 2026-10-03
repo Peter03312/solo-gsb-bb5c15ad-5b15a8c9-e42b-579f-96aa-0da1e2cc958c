@@ -63,6 +63,16 @@ CREATE TABLE IF NOT EXISTS reservations (
     created_rules_version  INTEGER NOT NULL,
     created_at             TIMESTAMPTZ NOT NULL DEFAULT now(),
     cancelled_at           TIMESTAMPTZ,
+    -- Attendance (到场/离场).  checked_in_at is the server-recorded arrival
+    -- instant (set exactly once by a successful check-in); checked_out_at is
+    -- the server-recorded early-departure instant (set exactly once by a
+    -- successful check-out).  While both are NULL the reservation occupies its
+    -- full [start_utc, end_utc); after an early check-out it occupies only
+    -- [start_utc, checked_out_at) for every capacity decision — the remaining
+    -- part of the original window is released from that instant on.  The
+    -- original start/end columns never change.
+    checked_in_at          TIMESTAMPTZ,
+    checked_out_at         TIMESTAMPTZ,
     UNIQUE (point_id, idempotency_key)
 );
 
@@ -83,6 +93,12 @@ UPDATE reservations
  WHERE created_start_utc IS NULL
     OR created_end_utc IS NULL
     OR created_rules_version IS NULL;
+
+-- Upgrade path for databases created before attendance tracking existed.
+ALTER TABLE reservations
+    ADD COLUMN IF NOT EXISTS checked_in_at TIMESTAMPTZ;
+ALTER TABLE reservations
+    ADD COLUMN IF NOT EXISTS checked_out_at TIMESTAMPTZ;
 
 CREATE INDEX IF NOT EXISTS idx_reservations_point_active
     ON reservations (point_id, start_utc) WHERE status = 'active';

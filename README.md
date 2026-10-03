@@ -3,7 +3,10 @@
 为社区回收点维护**每周开放时段**、**指定日期全天停开**与**当日补开时段**，
 按当地日期范围查询，逐日返回**实际开放区间的 UTC 起止、当地日期和来源**；
 并支持以当前已发布日历为准的**到访预约**（幂等创建、凭证取消、变更保护、
-凭凭证改期、占用窗口候补与释放转正、跨点**改派**），把一次跨回收点
+凭凭证改期、占用窗口候补与释放转正、跨点**改派**），访客到场后凭预约号与
+原取消凭证**签到**、在起点后凭同一凭证**提前离场**（记录到场/离场时刻、
+重复操作返回首次记录、离场即时释放剩余占位并同事务按申请顺序转正候补、
+已签到不可改期或改派、容量判定一律按提前离场后的有效占用），把一次跨回收点
 行程的 2～5 站**整体预约**（全站校验通过才一次落库，否则整组回滚并指出
 失败站），以及访客确定行程前的**只读行程规划搜索**（给定有序站点、各站
 停留时长、站间最小间隔与带时区搜索起止，返回按各站开始时刻依次比较最早
@@ -57,6 +60,7 @@ docker compose up --build
 | `RESERVATION_MAX_DURATION_MINUTES` | `120` | 预约最长时长（分钟） |
 | `TRIP_SEARCH_MAX_DAYS` | `7` | 行程规划搜索（`POST /trips/plan`）允许的最大时间跨度（天） |
 | `LOCK_TTL_MINUTES` | `10` | 到访名额锁定的确认期限（分钟）；到期未确认的锁定自动释放 |
+| `CHECKIN_LEAD_MINUTES` | `15` | 签到窗口在预约起点前多少分钟开启（含该时刻；终点不含） |
 | `DATABASE_URL` | （无，由上面拼装） | 完整 libpq 连接串，**非容器/本地运行时**可直接设置，例如 `postgresql://recycle:recycle@localhost:5432/recycle` |
 
 容器内 API 固定监听 `0.0.0.0:8000`；容器内数据库主机固定为 `db:5432`。
@@ -81,6 +85,8 @@ uvicorn app.main:app --host 0.0.0.0 --port 8000
     存量旧点迁移后默认 **1**；
   - 容量一律按**半开区间 `[start, end)`** 计算：预约占用其 `[起, 止)`，
     两条预约**首尾相接**（一条结束时刻恰为另一条开始时刻）不计并发；
+    **提前离场**的预约自离场时刻起只占用 `[起, 离场时刻)`，其原窗口的
+    剩余部分即时释放（见“到场签到与离场”）；
   - 单站预约、改期、跨点改派、行程各站与候补转正共用同一判定：
     **请求窗口内每一时刻的未取消并发数都严格小于容量**才能占用；
     某一时刻达到容量即报沿用的 `409 reservation_overlap`；
@@ -162,6 +168,51 @@ uvicorn app.main:app --host 0.0.0.0 --port 8000
     为首次内容，状态字段反映当前状态），**异内容**报 `idempotency_conflict`；
     对象不存在、凭证错误、已取消或已开始、修订号过期沿用取消/改期接口的
     404/403/409 语义。原创建键重试仍返回首次创建快照（状态为已取消）。
+  - **到场签到与提前离场（check-in / check-out）**：访客凭**预约号与创建时
+    签发的原取消凭证**办理签到与离场，服务端分别记录**到场时刻
+    `checkin_at`** 与**离场时刻 `checkout_at`**。
+    **签到**窗口为预约起点前 `CHECKIN_LEAD_MINUTES`（默认 **15**）分钟
+    （**含**）至预约终点（**不含**）的半开区间 `[起点-15分, 终点)`；
+    **离场**窗口为预约起点（**含**）至终点（**不含**）的 `[起点, 终点)`。
+    - **重复签到**经同一凭证验证后返回**首次到场记录**（不覆盖、不改时刻）；
+      **重复离场**经凭证验证后返回**首次离场记录**（即使原窗口已过终点）。
+    - 凭证缺失或错误**始终**返回 `403 invalid_cancel_token`（无论是否已
+      签到/离场）；预约号不存在或不属于该点返回
+      `404 reservation_not_found`；该编号实际是该点一个**仍有效、尚未确认
+      的名额锁定**时返回 `409 lock_not_confirmed`（签到只对已确认的预约
+      受理；已过期或已确认的锁定编号仍按 404 处理）。
+    - 首次签到时预约**已取消**返回 `409 reservation_attendance_conflict`
+      （`details.reason = reservation_cancelled`）；签到时刻早于开窗或已到
+      终点返回 `409 attendance_window_closed`（`reason` 分别为
+      `not_yet_open` / `already_ended`，`details` 附 `start`/`end`/
+      `checkin_opens_at`/`now`）。
+    - 首次离场时**未签到**返回 `409 reservation_attendance_conflict`
+      （`reason = not_checked_in`）；**已取消**（`reason =
+      reservation_cancelled`）同样拒绝；未到起点返回
+      `409 attendance_window_closed`（`reason = not_started`），已到/过终点
+      返回 `already_ended`。
+    - **提前离场即时释放剩余占位**：记录离场的同一事务在回收点行锁下先
+      清理到期锁定，随后该预约对容量的有效占用变为
+      **`[起点, 离场时刻)`**（原 `start_utc`/`end_utc` 列不变），并按
+      **申请顺序**把当前放得下的候补转正（起点已过标记 `expired`；当前
+      规则下不开放或容量仍不足的暂留队列、继续扫描后续申请；放不下者继续
+      排队）。离场与名额分配同事务，**并发离场与候补转正/并发预约不会
+      双占用**；任一转正失败则离场与候补状态整体回滚。
+    - **已签到（无论是否已离场）的预约不可改期、不可改派**，返回
+      `409 reservation_attendance_conflict`（`reason = already_checked_in`）；
+      但**取消仍沿用原凭证语义**：可凭原凭证取消（取消释放其仍占用的
+      部分并触发候补转正），重复取消幂等。改期/改派的**同键同内容重放**
+      仍返回该次成功尝试的存档，优先于已签到拦截。
+    - **所有容量判定一律按提前离场后的有效占用**：单站预约创建、改期、
+      跨点改派、行程各站、行程规划搜索、名额锁定（申请前提与到期清理）、
+      候补（申请前提与释放转正扫描）以及容量下调（未来峰值）与规则发布/
+      时区变更的覆盖保护，都只统计 `[起点, 离场时刻)`；已离场预约中
+      起点至离场时刻的已占用部分仍正常阻挡重叠。首尾相接仍不计并发。
+    - 签到/离场**不改预约号、原起止时刻、修订号、取消凭证**，也不影响
+      **既有创建重试快照**（创建键同内容重试仍返回首次创建的窗口/规则
+      版本/修订号 `1` 与原凭证）；签到/离场接口本身不需要幂等键，重复
+      操作天然幂等。行程各站与锁定确认、候补转正生成的预约都是普通预约，
+      同样可签到、离场。
   - **候补（waitlist）**：当目标窗口日历有效、但因**容量不足**（窗口内某
     时刻未取消并发数已达到该点容量）而无法预约时，访客可提交 UTC 起止时间
     与幂等键申请候补。窗口本身必须通过与创建预约**相同的校验**（未来起点/
@@ -175,7 +226,8 @@ uvicorn app.main:app --host 0.0.0.0 --port 8000
     内嵌**转正预约的实时快照**（预约号、取消凭证、修订号等，凭证按转正时
     规则版本签发）。排队中的申请可凭密钥撤回（`withdrawn`），重复撤回幂等；
     已转正/已失效的申请不可撤回。
-  - **释放或扩容即转正（同一事务）**：预约**取消或改期**释放名额、或
+  - **释放或扩容即转正（同一事务）**：预约**取消或改期**释放名额、
+    **访客提前离场**释放剩余占位、或
     **上调容量**时，在同一事务内、在回收点行锁下按申请先后（`id` 升序）
     扫描该点候补队列：起点时刻已过的标记 `expired`；在**当前规则**下不再
     完整开放、或转正后会使窗口内某时刻并发数达到容量的**暂留队列**继续
@@ -373,6 +425,8 @@ GET /points/{id}/calendar?from=YYYY-MM-DD&to=YYYY-MM-DD[&version=N]
 | `POST` | `/points/{id}/reservations/{rid}/reschedule` | 凭取消凭证改期（200；同键同内容重试原样返回） |
 | `POST` | `/points/{id}/reservations/{rid}/reassign` | 凭取消凭证改派到另一回收点（200；同键同内容重试返回首次结果） |
 | `POST` | `/points/{id}/reservations/{rid}/cancel` | 凭取消凭证取消（200，可重复；释放时同事务转正候补） |
+| `POST` | `/points/{id}/reservations/{rid}/checkin` | 凭原取消凭证签到（窗口 `[起点-15分, 终点)`；重复返回首次记录） |
+| `POST` | `/points/{id}/reservations/{rid}/checkout` | 已签到后凭同一凭证提前离场（窗口 `[起点, 终点)`；释放剩余占位并同事务转正候补；重复返回首次记录） |
 
 创建请求体（`start`/`end` 为带时区偏移的 ISO-8601 时间戳，统一按 UTC 解释）：
 
@@ -541,6 +595,70 @@ POST /points/{id}/reservations/{rid}/reassign
   双占用也不会死锁。
 - 原预约的**创建幂等键**不受影响：同内容重试仍返回首次创建快照
   （状态字段为取消后的当前状态）。
+
+#### 签到与离场（check-in / check-out）
+
+访客到场后凭**预约号与原取消凭证**签到；已签到者可在起点（含）至终点
+（不含）之间凭**同一凭证**办理提前离场。两个接口请求体均与取消接口相同：
+
+```json
+{ "cancel_token": "r9vQ…" }
+```
+
+- **签到窗口**：预约起点前 `CHECKIN_LEAD_MINUTES`（默认 15）分钟（含）至
+  终点（不含），即 `[起点-15分, 终点)`；早于开窗返回
+  `409 attendance_window_closed`（`details.reason = not_yet_open`，附
+  `checkin_opens_at`），已到/过终点返回同码 `already_ended`。
+- **离场窗口**：`[起点, 终点)`；未到起点返回 `409 attendance_window_closed`
+  （`reason = not_started`），已到/过终点返回 `already_ended`。
+- 凭证缺失/错误始终 `403 invalid_cancel_token`；首次离场时未签到返回
+  `409 reservation_attendance_conflict`（`reason = not_checked_in`）；对已
+  取消预约首次签到/离场返回同码 `reservation_cancelled`；编号是仍有效、
+  未确认锁定时签到返回 `409 lock_not_confirmed`。
+- **重复签到/重复离场**经凭证验证后返回**首次记录**（时刻不变）；重复
+  操作不需要幂等键。
+- 离场成功后，该预约的有效占用变为 `[start, checkout_at)`：**从离场时刻
+  起释放剩余占位**，并在**同一事务**按申请顺序转正候补；已占用的
+  `[start, checkout_at)` 仍阻挡重叠。已签到预约不可改期/改派
+  （`409 reservation_attendance_conflict`，`reason = already_checked_in`），
+  但仍可凭原凭证取消。预约号、原 `start`/`end`、修订号、取消凭证与创建
+  重试快照均不变。
+
+签到成功响应（200；`checkout_at` 此时为 `null`）：
+
+```json
+{
+  "id": 7,
+  "point_id": 1,
+  "status": "active",
+  "revision": 1,
+  "start": "2026-10-01T09:00:00Z",
+  "end": "2026-10-01T10:00:00Z",
+  "rules_version": 3,
+  "created_at": "2026-09-30T08:00:00Z",
+  "cancelled_at": null,
+  "checkin_at": "2026-10-01T08:50:12Z",
+  "checkout_at": null
+}
+```
+
+离场成功响应（200；自此该预约只占用 `[start, checkout_at)`）：
+
+```json
+{
+  "id": 7,
+  "point_id": 1,
+  "status": "active",
+  "revision": 1,
+  "start": "2026-10-01T09:00:00Z",
+  "end": "2026-10-01T10:00:00Z",
+  "rules_version": 3,
+  "created_at": "2026-09-30T08:00:00Z",
+  "cancelled_at": null,
+  "checkin_at": "2026-10-01T08:50:12Z",
+  "checkout_at": "2026-10-01T09:20:40Z"
+}
+```
 
 ### 4.5 候补（waitlist）
 
@@ -894,6 +1012,9 @@ ISO-8601 时刻，统一按 UTC 解释，搜索跨度最多 7 天；
 | 409 | `outside_open_hours` | 预约（或改期/改派后的新窗口、行程任一站窗口、锁定窗口）未完整落在相应点当前已发布日历的任一段连续开放区间内 |
 | 409 | `revision_conflict` | 改期/改派 `expected_revision` 与预约当前修订号不符（`details` 给出双方修订号） |
 | 409 | `reservation_not_reschedulable` | 改期/改派对象已取消或已开始（`details.reason` 区分 `reservation_cancelled` / `reservation_started`） |
+| 409 | `reservation_attendance_conflict` | 到场状态冲突：首次签到/离场的预约已取消（`reason=reservation_cancelled`）、首次离场前未签到（`reason=not_checked_in`）、已签到预约被改期或改派（`reason=already_checked_in`） |
+| 409 | `attendance_window_closed` | 签到/离场时刻不在对应窗口（签到 `[起点-15分, 终点)`、离场 `[起点, 终点)`；`details.reason` 为 `not_yet_open` / `already_ended` / `not_started`，附 `start`/`end`/`now`） |
+| 409 | `lock_not_confirmed` | 签到编号实际是该点一个仍有效、尚未确认的名额锁定；签到只受理已确认的预约（已过期/已确认锁定编号按 `reservation_not_found` 处理） |
 | 409 | `reservation_change_conflict` | 发布规则或修改时区将使未取消预约或有效锁定不再完整开放（`details.conflicting_reservation_ids` / `details.conflicting_lock_ids` 给出冲突编号） |
 | 404 | `waitlist_entry_not_found` | 候补号不存在（或不属于该回收点） |
 | 403 | `invalid_waitlist_token` | 查询/撤回候补时未提供查询密钥或密钥不匹配 |
@@ -1066,9 +1187,32 @@ curl -s -X POST localhost:8000/trips/plan \
 #      {"point_id":2,"start":"<stops[1].start>","end":"<stops[1].end>"}]}
 ```
 
-名额锁定快速体验（回收点 `1` 已发布覆盖该时段的规则）：
+签到 / 提前离场快速体验（预约窗口起点前 15 分钟起可签到；`examples/curl_examples.sh`
+末尾会自动创建一个约 14 分钟后开始的预约并演示全过程）：
 
 ```bash
+# 凭预约号与原取消凭证签到（窗口 [起点-15分, 终点)）
+curl -s -X POST localhost:8000/points/1/reservations/7/checkin \
+  -H 'Content-Type: application/json' \
+  -d '{"cancel_token":"<创建响应中的 cancel_token>"}'
+# -> 200：{"checkin_at":"...","checkout_at":null, ...}
+#    重复签到返回同一 checkin_at；凭证错误 403；过早 409 attendance_window_closed
+#    （reason=not_yet_open）；已取消 409 reservation_attendance_conflict。
+
+# 已签到、且当前时刻进入 [起点, 终点) 后凭同一凭证提前离场
+curl -s -X POST localhost:8000/points/1/reservations/7/checkout \
+  -H 'Content-Type: application/json' \
+  -d '{"cancel_token":"<创建响应中的 cancel_token>"}'
+# -> 200：{"checkin_at":"...","checkout_at":"..."}
+#    自该时刻起剩余占位释放：[start, checkout_at) 仍被占用、其后可约，
+#    候补在同一事务按申请顺序转正；重复离场返回同一 checkout_at。
+#    未签到/已取消 409 reservation_attendance_conflict；
+#    未到起点 409 attendance_window_closed（reason=not_started）。
+# 已签到预约改期/改派 -> 409 reservation_attendance_conflict
+# （reason=already_checked_in）；取消仍可用原凭证（可重复）。
+```
+
+名额锁定快速体验（回收点 `1` 已发布覆盖该时段的规则）：```bash
 # 申请一次 10 分钟的到访名额锁定（窗口规则与单站预约一致）
 curl -s -X POST localhost:8000/points/1/locks \
   -H 'Content-Type: application/json' \
@@ -1181,6 +1325,20 @@ pytest -q
   过期锁定不再占容量且由容量写操作清理并按申请先后转正候补、并发确认
   恰好转换一次、并发同窗口锁定恰好一个成功、到期瞬间确认与转正并发不
   重复占位。
+- 到场签到与提前离场（本轮）：签到窗口 `[起点-15分, 终点)`（恰 -15 分与
+  恰起点受理、恰终点拒绝、过早 `not_yet_open`）、离场窗口 `[起点, 终点)`
+  （未到起点 `not_started`、恰终点/过后 `already_ended`）、服务端记录
+  `checkin_at`/`checkout_at`、重复签到与重复离场经凭证验证返回首次记录
+  （含窗口结束后重放）、凭证缺失/错误始终 403、预约号 404、编号为仍有效
+  未确认锁定时 `lock_not_confirmed`（过期后 404）、已取消首次签到/离场
+  与未签到首次离场 409 `reservation_attendance_conflict`、锁定确认/候补
+  转正生成的预约可签到；提前离场后有效占用为 `[起点, 离场时刻)`（贴边
+  可约、已占用段仍阻挡、候补按申请顺序转正且放不下者暂留并继续扫描、
+  起点已过者过期）、候补转正后真实占名额且并发预约不双占、容量下调与
+  规则发布覆盖保护按有效占用判定、行程与规划搜索/直接预订/容量修改均按
+  有效占用、已签到不可改期/改派（重放优先、原窗口与修订号不变）、已签到
+  仍可凭原凭证取消、预约号/原起止/修订号/凭证/创建重试快照全程不变、
+  并发离场+预订+候补恰好一方占名额、并发重复离场只产生一条离场记录。
 - 全部可区分错误码。
 
 ---
@@ -1191,7 +1349,7 @@ pytest -q
 app/
   config.py      环境变量配置
   schema.sql     PostgreSQL 建表脚本（启动时幂等执行）
-  db.py          连接池、版本化规则的原子发布与读取、预约/改期/改派/行程/候补与名额锁定存储（行锁 + 事务 + 释放转正扫描 + 到期锁定清理）
+  db.py          连接池、版本化规则的原子发布与读取、预约/改期/改派/签到/离场/行程/候补与名额锁定存储（行锁 + 事务 + 释放转正扫描 + 到期锁定清理 + 提前离场有效占用）
   scheduler.py   纯 Python 日历展开引擎（跨午夜/停开/补开/合并/DST/连续开放区间）
   planner.py     纯 Python 只读行程规划引擎（逐站最早可行起点、半开容量满额区间）
   schemas.py     Pydantic 请求响应模型与时段语义校验

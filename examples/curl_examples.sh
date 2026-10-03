@@ -685,3 +685,65 @@ api POST "/points/$LPID/reservations" "{
 # Note: a lock left unconfirmed past its expires_at deadline (10 minutes by
 # default) stops occupying; confirming it then fails with 409 lock_expired,
 # and the next capacity-touching write sweeps it and promotes the waitlist.
+
+echo
+echo "== Attendance (签到 / 离场): dynamic near-future window =="
+echo "-- create a Shanghai point open all day today and tomorrow --"
+ATT_JSON="$(api POST /points '{"name":"到场演示点","timezone":"Asia/Shanghai"}')"
+ATT_PID="$(echo "$ATT_JSON" | sed -n 's/.*"id":\([0-9]*\).*/\1/p')"
+SH_TODAY_WD="$(TZ=Asia/Shanghai date +%u)"
+SH_TOMORROW_WD="$(TZ=Asia/Shanghai date -d '+1 day' +%u 2>/dev/null || TZ=Asia/Shanghai date -v+1d +%u)"
+api POST "/points/$ATT_PID/rules" "{
+  \"expected_version\": 0,
+  \"rules\": {\"weekly\": [
+    {\"weekday\": $SH_TODAY_WD, \"start_time\": \"00:00\", \"end_time\": \"23:59\"},
+    {\"weekday\": $SH_TOMORROW_WD, \"start_time\": \"00:00\", \"end_time\": \"23:59\"}
+  ], \"closed_dates\": [], \"makeup\": []}
+}"
+
+# Visit window: start ~14 minutes from now (30 minutes long), so check-in's
+# [start-15m, end) window is already open while the booking is still ahead.
+read -r S0 E0 <<EOF
+$(python3 - <<'PY'
+from datetime import datetime, timedelta, timezone
+sh = timezone(timedelta(hours=8))
+s = (datetime.now(sh) + timedelta(minutes=14)).replace(second=0, microsecond=0)
+print(s.isoformat(), (s + timedelta(minutes=30)).isoformat())
+PY
+)
+EOF
+echo "visit window: $S0 -> $E0"
+VISIT_JSON="$(api POST "/points/$ATT_PID/reservations" "{
+  \"idempotency_key\": \"demo-attendance-1\",
+  \"start\": \"$S0\",
+  \"end\": \"$E0\"
+}")"
+echo "$VISIT_JSON"
+ARID="$(echo "$VISIT_JSON" | sed -n 's/.*"id":\([0-9]*\).*/\1/p')"
+ATOKEN="$(echo "$VISIT_JSON" | sed -n 's/.*"cancel_token":"\([^"]*\)".*/\1/p')"
+
+echo
+echo "-- check-in with the original cancel token (200; records checkin_at) --"
+api POST "/points/$ATT_PID/reservations/$ARID/checkin" "{\"cancel_token\":\"$ATOKEN\"}"
+
+echo
+echo "-- repeat check-in replays the first arrival record (same checkin_at) --"
+api POST "/points/$ATT_PID/reservations/$ARID/checkin" "{\"cancel_token\":\"$ATOKEN\"}"
+
+echo
+echo "-- wrong credential is always refused (403 invalid_cancel_token) --"
+api POST "/points/$ATT_PID/reservations/$ARID/checkin" '{"cancel_token":"wrong"}'
+
+echo
+echo "-- check-out before the start is refused (409 attendance_window_closed) --"
+api POST "/points/$ATT_PID/reservations/$ARID/checkout" "{\"cancel_token\":\"$ATOKEN\"}"
+
+echo
+echo "-- at/after the start, check-out records departure and releases the --"
+echo "-- remaining slot; a repeat check-out replays the first checkout_at.  --"
+echo "# wait until $S0, then:"
+echo "#   curl -sS -X POST $BASE_URL/points/$ATT_PID/reservations/$ARID/checkout \\"
+echo "#     -H 'Content-Type: application/json' -d '{\"cancel_token\":\"<token>\"}'"
+echo "# A first check-out without a check-in, a cancelled reservation, or a"
+echo "# call at/after the end is refused with 409; a checked-in reservation"
+echo "# cannot be rescheduled or reassigned (409 reservation_attendance_conflict)."

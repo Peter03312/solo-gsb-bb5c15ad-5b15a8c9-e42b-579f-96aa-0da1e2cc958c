@@ -833,6 +833,106 @@ def main() -> None:
     # confirming it then fails with 409 lock_expired, and the next
     # capacity-touching write sweeps it and promotes the waitlist.
 
+    # ------------------------------------------------------------------
+    # Attendance (签到 / 离场): arrive with the reservation number + the
+    # original cancel token, then leave early and release the remainder.
+    # Check-in opens 15 minutes before the start (included) and closes at
+    # the end (excluded); check-out opens at the start and closes at the end.
+    # ------------------------------------------------------------------
+    status, attend_point = call(
+        "POST", "/points", {"name": "到场演示点", "timezone": "Asia/Shanghai"}
+    )
+    show("create a Shanghai point for the attendance demo", status, attend_point)
+    apid = attend_point["id"]
+
+    # One publish carries an all-day rule for the current Shanghai weekday and
+    # the next one, so a window ~14 minutes out is open right now.
+    sh_tz = timezone(timedelta(hours=8))
+    sh_now = datetime.now(timezone.utc).astimezone(sh_tz)
+    sh_today = sh_now.date()
+    sh_tomorrow = (sh_now + timedelta(days=1)).date()
+    status, published = call(
+        "POST",
+        f"/points/{apid}/rules",
+        {
+            "expected_version": 0,
+            "rules": {
+                "weekly": [
+                    {"weekday": sh_today.isoweekday(),
+                     "start_time": "00:00", "end_time": "23:59"},
+                    {"weekday": sh_tomorrow.isoweekday(),
+                     "start_time": "00:00", "end_time": "23:59"},
+                ],
+                "closed_dates": [],
+                "makeup": [],
+            },
+        },
+    )
+    show("publish an all-day rule for today and tomorrow (Shanghai)",
+         status, published)
+
+    # Start ~14 minutes out: check-in opens at start-15m, i.e. ~1 minute ago,
+    # so the check-in call below is inside its window [start-15m, end) now.
+    visit_start = (sh_now + timedelta(minutes=14)).replace(
+        second=0, microsecond=0
+    )
+    visit_end = visit_start + timedelta(minutes=30)
+    status, visit = call(
+        "POST",
+        f"/points/{apid}/reservations",
+        {
+            "idempotency_key": "attendance-demo-1",
+            "start": visit_start.isoformat(),
+            "end": visit_end.isoformat(),
+        },
+    )
+    show("book a window ~14 minutes out", status, visit)
+    visit_id = visit["id"]
+    visit_token = visit["cancel_token"]
+
+    status, arrived = call(
+        "POST", f"/points/{apid}/reservations/{visit_id}/checkin",
+        {"cancel_token": visit_token},
+    )
+    show("check-in inside [start-15m, end) (200, records checkin_at)",
+         status, arrived)
+
+    status, again = call(
+        "POST", f"/points/{apid}/reservations/{visit_id}/checkin",
+        {"cancel_token": visit_token},
+    )
+    show("repeat check-in replays the first arrival (200)", status, again)
+    assert again["checkin_at"] == arrived["checkin_at"]
+
+    status, bad_token = call(
+        "POST", f"/points/{apid}/reservations/{visit_id}/checkin",
+        {"cancel_token": "wrong-token"},
+    )
+    show("wrong credential is always refused (403 invalid_cancel_token)",
+         status, bad_token)
+
+    status, too_soon = call(
+        "POST", f"/points/{apid}/reservations/{visit_id}/checkout",
+        {"cancel_token": visit_token},
+    )
+    show("check-out before the start is refused (409, not_started)",
+         status, too_soon)
+
+    print(
+        "\n-- Once the start time arrives, this records the departure, "
+        "releases the\n"
+        "   remaining slot from that instant and promotes fitting waitlist "
+        "entries in\n"
+        "   the same transaction:\n"
+        f"   POST /points/{apid}/reservations/{visit_id}/checkout\n"
+        '   body: {"cancel_token": "<cancel_token>"}\n'
+        "   -> 200 {\"checkin_at\": ..., \"checkout_at\": ...}; repeating it\n"
+        "      replays the first departure. A first check-out without a prior\n"
+        "      check-in, a cancelled reservation, or a call at/after the end\n"
+        "      is refused with 409; a checked-in reservation cannot be\n"
+        "      rescheduled or reassigned (409 reservation_attendance_conflict)."
+    )
+
 
 if __name__ == "__main__":
     main()

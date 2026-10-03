@@ -491,6 +491,30 @@ class ReservationStateOut(BaseModel):
     cancelled_at: datetime | None
 
 
+class ReservationAttendanceOut(BaseModel):
+    """State of a reservation after check-in / check-out (no cancel token).
+
+    ``checkin_at`` is the server-recorded arrival instant and ``checkout_at``
+    the server-recorded early-departure instant (null until the matching
+    operation has happened).  ``start``/``end`` are always the original
+    window and ``revision`` is unchanged by attendance; after a check-out the
+    reservation only occupies ``[start, checkout_at)`` for every capacity
+    decision.
+    """
+
+    id: int
+    point_id: int
+    status: str
+    revision: int
+    start: str
+    end: str
+    rules_version: int
+    created_at: datetime
+    cancelled_at: datetime | None
+    checkin_at: datetime | None
+    checkout_at: datetime | None
+
+
 class WaitlistOut(BaseModel):
     """Waitlist application state returned by apply / status / withdraw.
 
