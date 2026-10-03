@@ -833,6 +833,106 @@ def main() -> None:
     # confirming it then fails with 409 lock_expired, and the next
     # capacity-touching write sweeps it and promotes the waitlist.
 
+    # ------------------------------------------------------------------
+    # Check-in / check-out (签到/离场).  Book a visit starting 10 minutes
+    # from now — check-in opens 15 minutes before the start — on a point
+    # whose weekly rules cover every wall-clock minute (24/7), record the
+    # arrival, and show the departure rules.
+    # ------------------------------------------------------------------
+    status, checkin_point = call(
+        "POST", "/points", {"name": "签到演示点", "timezone": "UTC"}
+    )
+    show("create a point for check-in / check-out", status, checkin_point)
+    cpid = checkin_point["id"]
+    weekly = [
+        rule
+        for day in range(1, 8)
+        for rule in (
+            {"weekday": day, "start_time": "00:00", "end_time": "23:59"},
+            {"weekday": day, "start_time": "23:00", "end_time": "02:00"},
+        )
+    ]
+    call(
+        "POST",
+        f"/points/{cpid}/rules",
+        {
+            "expected_version": 0,
+            "rules": {"weekly": weekly, "closed_dates": [], "makeup": []},
+        },
+    )
+
+    def iso(dt: datetime) -> str:
+        return dt.isoformat().replace("+00:00", "Z")
+
+    start = datetime.now(timezone.utc) + timedelta(minutes=10)
+    end = datetime.now(timezone.utc) + timedelta(minutes=70)
+    status, visit = call(
+        "POST",
+        f"/points/{cpid}/reservations",
+        {"idempotency_key": "checkin-demo-1", "start": iso(start), "end": iso(end)},
+    )
+    show("book a visit starting 10 minutes from now (201)", status, visit)
+    rid = visit["id"]
+    token = visit["cancel_token"]
+
+    status, arrival = call(
+        "POST",
+        f"/points/{cpid}/reservations/{rid}/checkin",
+        {"cancel_token": token},
+    )
+    show(
+        "check in within 15 min before the start (200: checked_in_at)",
+        status,
+        arrival,
+    )
+
+    status, again = call(
+        "POST",
+        f"/points/{cpid}/reservations/{rid}/checkin",
+        {"cancel_token": token},
+    )
+    show("a repeat check-in replays the first record", status, again)
+    assert again["checked_in_at"] == arrival["checked_in_at"]
+
+    status, refused = call(
+        "POST",
+        f"/points/{cpid}/reservations/{rid}/checkin",
+        {"cancel_token": "wrong"},
+    )
+    show("a wrong token is refused (403 invalid_cancel_token)", status, refused)
+
+    status, too_early = call(
+        "POST",
+        f"/points/{cpid}/reservations/{rid}/checkout",
+        {"cancel_token": token},
+    )
+    show(
+        "check-out before the start is refused (409 checkout_not_allowed)",
+        status,
+        too_early,
+    )
+
+    status, blocked = call(
+        "POST",
+        f"/points/{cpid}/reservations/{rid}/reschedule",
+        {
+            "cancel_token": token,
+            "idempotency_key": "checkin-demo-move",
+            "expected_revision": 1,
+            "start": iso(start + timedelta(hours=2)),
+            "end": iso(end + timedelta(hours=2)),
+        },
+    )
+    show(
+        "a checked-in visit cannot be rescheduled (409 reservation_checked_in)",
+        status,
+        blocked,
+    )
+    # Once the start arrives (up to the end, exclusive), the same checkout
+    # call records checked_out_at, releases the rest of the window and
+    # promotes the waitlist in the same transaction; a repeat checkout
+    # replays the first record and a wrong token is always refused.
+
 
 if __name__ == "__main__":
     main()

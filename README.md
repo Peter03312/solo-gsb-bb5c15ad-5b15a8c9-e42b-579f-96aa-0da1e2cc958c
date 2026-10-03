@@ -9,7 +9,12 @@
 停留时长、站间最小间隔与带时区搜索起止，返回按各站开始时刻依次比较最早
 的一组完整行程；无副作用、不占名额、无解返回空结果），以及**到访名额
 锁定**（按单站预约同一套窗口规则先锁定一个名额 10 分钟，凭确认凭证在
-到期前原子转为普通预约；过期自动释放并触发候补转正）。
+到期前原子转为普通预约；过期自动释放并触发候补转正），以及**到访签到
+与离场**（凭预约号与原取消凭证，在预约起点前 15 分钟（含）至终点（不含）
+签到记录到场，已签到者在起点（含）至终点（不含）离场记录离场时刻；
+离场自该时刻起释放剩余占位并在同一事务按申请顺序转正候补，单站预约、
+改期、改派、行程、规划搜索、名额锁定与容量变更一律按提前离场后的
+有效占用判定）。
 
 技术栈：Python 3.11 · FastAPI · PostgreSQL 16 · psycopg 3 · Uvicorn。
 
@@ -57,6 +62,7 @@ docker compose up --build
 | `RESERVATION_MAX_DURATION_MINUTES` | `120` | 预约最长时长（分钟） |
 | `TRIP_SEARCH_MAX_DAYS` | `7` | 行程规划搜索（`POST /trips/plan`）允许的最大时间跨度（天） |
 | `LOCK_TTL_MINUTES` | `10` | 到访名额锁定的确认期限（分钟）；到期未确认的锁定自动释放 |
+| `CHECKIN_EARLY_MINUTES` | `15` | 签到窗口在预约起点前提前开放的分钟数（签到窗口为起点前该分钟数（含）至终点（不含）） |
 | `DATABASE_URL` | （无，由上面拼装） | 完整 libpq 连接串，**非容器/本地运行时**可直接设置，例如 `postgresql://recycle:recycle@localhost:5432/recycle` |
 
 容器内 API 固定监听 `0.0.0.0:8000`；容器内数据库主机固定为 `db:5432`。
@@ -258,6 +264,40 @@ uvicorn app.main:app --host 0.0.0.0 --port 8000
   - 幂等键按回收点隔离（与预约/候补/行程键命名空间相互独立）：同点同键
     同内容重试返回原锁定的当前状态（HTTP 200，含已确认/已过期的最新状
     态），异内容报 `idempotency_conflict`。
+- **到访签到与离场（check-in / check-out）**：
+  - **签到**：访客凭**预约号与原取消凭证**，在预约起点前
+    `CHECKIN_EARLY_MINUTES`（默认 15）分钟（含）至终点（不含）之间签到，
+    服务端记录到场时刻 `checked_in_at`；对仍有效的预约**重复签到返回首次
+    记录**（HTTP 200，不重写到场时刻）。凭证缺失或错误返回
+    `403 invalid_cancel_token`；预约已取消返回 `409 checkin_not_allowed`
+    （`details.reason` 为 `reservation_cancelled`）；号码属于**尚未确认
+    的锁定**（锁定还不是预约）返回 `409 lock_not_confirmed`；预约号不存在
+    返回 `404 reservation_not_found`。未到签到窗口或已过终点返回
+    `409 checkin_not_allowed`（`details.reason` 为 `too_early` /
+    `already_ended`，附签到开放时刻或终点与当前时刻）。
+  - **离场**：已签到者在预约起点（含）至终点（不含）之间凭同一取消凭证
+    办理离场，服务端记录离场时刻 `checked_out_at`，并**自该时刻起释放
+    剩余占位**——该预约的有效占用收缩为 `[起点, 离场时刻)`，同时在
+    **同一事务**内按申请先后扫描该点候补队列，把当前放得下的申请逐条
+    转正（与取消/改期释放、上调容量同一套转正语义）。**重复离场**经原
+    凭证验证后返回首次记录；**凭证错误始终拒绝**（403，即使已离场）；
+    首次离场时**未签到**或**已过终点**返回 `409 checkout_not_allowed`
+    （`details.reason` 为 `not_checked_in` / `too_early` /
+    `already_ended`）。已签到后取消的预约仍可在窗口内补记离场（取消
+    语义不变，释放早已发生，离场只补登事实）。
+  - **已签到预约不可改期或改派**：改期/改派返回沿用的
+    `409 reservation_not_reschedulable`，`details.reason` 为
+    `reservation_checked_in`（签到后、甚至离场后均不可再移动窗口）；
+    **取消仍沿用原凭证语义**，不受签到影响。
+  - **有效占用判定**：单站预约、改期、改派、行程各站、规划搜索、名额
+    锁定（申请与确认）、候补申请前提与释放转正扫描、以及**容量变更**
+    （下调保护）一律按 `[起点, COALESCE(离场时刻, 终点))` 的有效占用
+    计算；离场与名额分配（预约/锁定/行程/转正）在同一回收点行锁下
+    串行，并发离场与并发分配**不会双占**。
+  - **既有快照不变**：签到/离场只追加两个服务端时间戳——预约号、原
+    起止时刻、修订号、取消凭证与既有创建重试快照（含各既有端点的
+    响应结构）均保持不变；签到/离场响应为专用结构（公开状态 +
+    `checked_in_at` / `checked_out_at`，不含取消凭证）。
 
 ---
 
@@ -373,6 +413,8 @@ GET /points/{id}/calendar?from=YYYY-MM-DD&to=YYYY-MM-DD[&version=N]
 | `POST` | `/points/{id}/reservations/{rid}/reschedule` | 凭取消凭证改期（200；同键同内容重试原样返回） |
 | `POST` | `/points/{id}/reservations/{rid}/reassign` | 凭取消凭证改派到另一回收点（200；同键同内容重试返回首次结果） |
 | `POST` | `/points/{id}/reservations/{rid}/cancel` | 凭取消凭证取消（200，可重复；释放时同事务转正候补） |
+| `POST` | `/points/{id}/reservations/{rid}/checkin` | 凭取消凭证签到（200，重复签到返回首次记录） |
+| `POST` | `/points/{id}/reservations/{rid}/checkout` | 凭取消凭证离场（200；释放剩余占位并同事务转正候补，重复离场返回首次记录） |
 
 创建请求体（`start`/`end` 为带时区偏移的 ISO-8601 时间戳，统一按 UTC 解释）：
 
@@ -541,6 +583,64 @@ POST /points/{id}/reservations/{rid}/reassign
   双占用也不会死锁。
 - 原预约的**创建幂等键**不受影响：同内容重试仍返回首次创建快照
   （状态字段为取消后的当前状态）。
+
+#### 签到（check-in）
+
+```
+POST /points/{id}/reservations/{rid}/checkin
+```
+
+请求体与取消相同，为 `{ "cancel_token": "…" }`。预约须**未取消**，且当前
+时刻落在**起点前 15 分钟（含，`CHECKIN_EARLY_MINUTES` 可配）至终点
+（不含）**之间；成功记录服务端到场时刻并返回 200：
+
+```json
+{
+  "id": 7,
+  "point_id": 1,
+  "status": "active",
+  "revision": 1,
+  "start": "2026-10-01T09:00:00Z",
+  "end": "2026-10-01T10:00:00Z",
+  "rules_version": 3,
+  "created_at": "2026-09-30T08:00:00Z",
+  "cancelled_at": null,
+  "checked_in_at": "2026-10-01T08:47:00Z",
+  "checked_out_at": null
+}
+```
+
+- 对仍有效的预约**重复签到返回首次记录**（`checked_in_at` 不变）；
+  凭证缺失/错误返回 `403 invalid_cancel_token`；已取消返回
+  `409 checkin_not_allowed`（`details.reason: "reservation_cancelled"`，
+  即使曾签到过）；号码属于尚未确认的锁定返回 `409 lock_not_confirmed`；
+  预约号不存在返回 `404 reservation_not_found`。
+- 未到签到窗口返回 `409 checkin_not_allowed`
+  （`details.reason: "too_early"`，附 `checkin_opens_at`）；已过终点返回
+  同码（`details.reason: "already_ended"`）。
+
+#### 离场（check-out）
+
+```
+POST /points/{id}/reservations/{rid}/checkout
+```
+
+请求体同样为 `{ "cancel_token": "…" }`。须**已签到**且当前时刻落在
+**起点（含）至终点（不含）**之间；成功记录服务端离场时刻并返回 200
+（响应结构与签到相同，`checked_out_at` 为刚记录的时刻）。离场**自该
+时刻起释放剩余占位**（有效占用收缩为 `[起点, 离场时刻)`），并在**同一
+事务**内按申请先后把当前放得下的候补逐条转正。
+
+- **重复离场**经原凭证验证后返回首次记录（`checked_out_at` 不变）；
+  **凭证错误始终拒绝**（`403 invalid_cancel_token`，即使已离场）。
+- 首次离场时未签到返回 `409 checkout_not_allowed`
+  （`details.reason: "not_checked_in"`）；未到起点（`too_early`）或已过
+  终点（`already_ended`）同样拒绝。
+- 已签到预约**不可改期或改派**（`409 reservation_not_reschedulable`，
+  `details.reason: "reservation_checked_in"`）；**取消仍沿用原凭证语义**。
+- 离场后该预约的剩余窗口立即对所有容量判定可见：单站预约、改期、改派、
+  行程、规划搜索、名额锁定与容量变更均按提前离场后的有效占用计算；
+  离场与名额分配在同一回收点行锁下串行，并发下不会双占。
 
 ### 4.5 候补（waitlist）
 
@@ -893,7 +993,10 @@ ISO-8601 时刻，统一按 UTC 解释，搜索跨度最多 7 天；
 | 409 | `capacity_conflict` | 下调容量至低于某未来时刻（含进行中预约）占用数（未取消预约 + 有效锁定）时拒绝（`details` 给出 `requested_capacity` / `current_capacity` / `future_peak_concurrency`），原容量不变 |
 | 409 | `outside_open_hours` | 预约（或改期/改派后的新窗口、行程任一站窗口、锁定窗口）未完整落在相应点当前已发布日历的任一段连续开放区间内 |
 | 409 | `revision_conflict` | 改期/改派 `expected_revision` 与预约当前修订号不符（`details` 给出双方修订号） |
-| 409 | `reservation_not_reschedulable` | 改期/改派对象已取消或已开始（`details.reason` 区分 `reservation_cancelled` / `reservation_started`） |
+| 409 | `reservation_not_reschedulable` | 改期/改派对象已取消、已签到或已开始（`details.reason` 区分 `reservation_cancelled` / `reservation_checked_in` / `reservation_started`） |
+| 409 | `checkin_not_allowed` | 签到不可用：预约已取消、未到签到窗口（起点前 15 分钟）或已过终点（`details.reason` 区分 `reservation_cancelled` / `too_early` / `already_ended`） |
+| 409 | `checkout_not_allowed` | 离场不可用：未签到、未到起点或已过终点（`details.reason` 区分 `not_checked_in` / `too_early` / `already_ended`） |
+| 409 | `lock_not_confirmed` | 签到/离场的号码属于尚未确认的锁定（锁定还不是预约，`details` 附 `lock_id` 与 `lock_status`） |
 | 409 | `reservation_change_conflict` | 发布规则或修改时区将使未取消预约或有效锁定不再完整开放（`details.conflicting_reservation_ids` / `details.conflicting_lock_ids` 给出冲突编号） |
 | 404 | `waitlist_entry_not_found` | 候补号不存在（或不属于该回收点） |
 | 403 | `invalid_waitlist_token` | 查询/撤回候补时未提供查询密钥或密钥不匹配 |
@@ -1099,6 +1202,38 @@ curl -s -X POST localhost:8000/points/1/locks \
 # 下一个触及该点容量的写操作会清理它并按申请先后转正候补。
 ```
 
+签到与离场快速体验（回收点 `1` 已发布覆盖**当前时段**的规则；签到窗口为
+起点前 15 分钟（含）至终点（不含），故示例取「10 分钟后开始」的预约）：
+
+```bash
+# 预约 10 分钟后开始的 1 小时到访
+START=$(date -u -d '+10 min' +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || date -u -v+10M +%Y-%m-%dT%H:%M:%SZ)
+END=$(date -u -d '+70 min' +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || date -u -v+70M +%Y-%m-%dT%H:%M:%SZ)
+curl -s -X POST localhost:8000/points/1/reservations \
+  -H 'Content-Type: application/json' \
+  -d "{\"idempotency_key\":\"visit-now-1\",\"start\":\"$START\",\"end\":\"$END\"}"
+# -> 201：{"id":7,"cancel_token":"r9vQ…", ...}
+
+# 立即签到（起点前 15 分钟内允许）：200，checked_in_at 为服务端到场时刻
+curl -s -X POST localhost:8000/points/1/reservations/7/checkin \
+  -H 'Content-Type: application/json' \
+  -d '{"cancel_token":"<创建响应中的 cancel_token>"}'
+# 重复签到返回首次记录（checked_in_at 不变）；
+# 凭证错误 403 invalid_cancel_token、已取消 409 checkin_not_allowed。
+
+# 起点未到时离场被拒绝（409 checkout_not_allowed，reason=too_early）；
+# 到达起点（含）后至终点（不含）再调用即记录离场时刻：
+curl -s -X POST localhost:8000/points/1/reservations/7/checkout \
+  -H 'Content-Type: application/json' \
+  -d '{"cancel_token":"<创建响应中的 cancel_token>"}'
+# -> 200：checked_out_at 为服务端离场时刻；自该时刻起剩余占位释放，
+#    同一事务内按申请顺序转正候补；重复离场凭原凭证返回首次记录，
+#    凭证错误始终 403。
+
+# 已签到的预约不可改期/改派（409 reservation_not_reschedulable，
+# reason=reservation_checked_in）；取消仍凭原凭证可用。
+```
+
 ---
 
 ## 6. 本地开发与测试
@@ -1181,6 +1316,17 @@ pytest -q
   过期锁定不再占容量且由容量写操作清理并按申请先后转正候补、并发确认
   恰好转换一次、并发同窗口锁定恰好一个成功、到期瞬间确认与转正并发不
   重复占位。
+- 签到与离场（本轮）：签到窗口边界（起点前 15 分钟含/终点不含/过早与
+  过晚拒绝）、重复签到返回首次记录（含窗口过后仍重放）、凭证缺失/错误
+  403、已取消拒绝（含签到后再取消）、未确认锁定 409 `lock_not_confirmed`、
+  预约号不存在/跨点 404、确认后的锁定转出的预约可正常签到；离场须先签到
+  （`not_checked_in`）、起点前 `too_early`、终点后 `already_ended`、重复
+  离场返回首次记录、凭证错误始终 403（含已离场后）、已签到取消后仍可
+  补记离场；已签到不可改期/改派（`reservation_checked_in`，离场后仍不可）、
+  取消沿用原语义、创建重试快照逐字段不变；离场释放剩余占位——新预约/
+  改期/改派/行程/锁定/规划搜索/容量下调/候补申请前提均按有效占用判定、
+  离场同事务按申请顺序转正候补（放不下者继续排队、再次释放后续转）；
+  并发离场与并发预约串行不双占、并发双离场只记录一次且无 500。
 - 全部可区分错误码。
 
 ---
@@ -1191,13 +1337,13 @@ pytest -q
 app/
   config.py      环境变量配置
   schema.sql     PostgreSQL 建表脚本（启动时幂等执行）
-  db.py          连接池、版本化规则的原子发布与读取、预约/改期/改派/行程/候补与名额锁定存储（行锁 + 事务 + 释放转正扫描 + 到期锁定清理）
+  db.py          连接池、版本化规则的原子发布与读取、预约/改期/改派/行程/候补与名额锁定存储、签到/离场记录（行锁 + 事务 + 释放转正扫描 + 到期锁定清理 + 有效占用口径）
   scheduler.py   纯 Python 日历展开引擎（跨午夜/停开/补开/合并/DST/连续开放区间）
   planner.py     纯 Python 只读行程规划引擎（逐站最早可行起点、半开容量满额区间）
   schemas.py     Pydantic 请求响应模型与时段语义校验
   errors.py      可区分错误类型
   main.py        FastAPI 路由与错误处理
-examples/        curl 与 Python 调用示例（含候补、改派、行程与名额锁定全流程）
-tests/           引擎单测 + 真实 PostgreSQL 的 API 集成测试（含候补、改派、行程与名额锁定）
+examples/        curl 与 Python 调用示例（含候补、改派、行程、名额锁定与签到/离场全流程）
+tests/           引擎单测 + 真实 PostgreSQL 的 API 集成测试（含候补、改派、行程、名额锁定与签到/离场）
 Dockerfile, docker-compose.yml
 ```

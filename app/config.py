@@ -16,6 +16,7 @@ class Settings:
     reservation_max_duration_minutes: int
     trip_search_max_days: int
     lock_ttl_minutes: int
+    checkin_early_minutes: int
 
     @staticmethod
     def load() -> "Settings":
@@ -40,6 +41,7 @@ class Settings:
             ),
             trip_search_max_days=int(os.getenv("TRIP_SEARCH_MAX_DAYS", "7")),
             lock_ttl_minutes=int(os.getenv("LOCK_TTL_MINUTES", "10")),
+            checkin_early_minutes=int(os.getenv("CHECKIN_EARLY_MINUTES", "15")),
         )
 
 

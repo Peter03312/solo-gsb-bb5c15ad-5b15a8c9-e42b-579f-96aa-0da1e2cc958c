@@ -111,6 +111,27 @@ class ReservationNotReschedulableError(ApiError):
     code = "reservation_not_reschedulable"
 
 
+class CheckinNotAllowedError(ApiError):
+    """Check-in (签到) is not allowed for this reservation right now."""
+
+    status_code = 409
+    code = "checkin_not_allowed"
+
+
+class CheckoutNotAllowedError(ApiError):
+    """Check-out (离场) is not allowed for this reservation right now."""
+
+    status_code = 409
+    code = "checkout_not_allowed"
+
+
+class LockNotConfirmedError(ApiError):
+    """The number names a slot lock that has not been confirmed yet."""
+
+    status_code = 409
+    code = "lock_not_confirmed"
+
+
 class InvalidRequestError(ApiError):
     """The request is structurally valid JSON but semantically unacceptable."""
 

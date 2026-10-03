@@ -314,6 +314,8 @@ def get_active_reservation_windows(
     Occupancy means active (non-cancelled) reservations plus *valid* slot
     locks (status ``locked`` whose confirmation deadline ``expires_at`` is
     still in the future at ``now``); an expired lock no longer occupies.
+    A reservation with a recorded departure (check-out) only occupies until
+    ``checked_out_at``: the remainder of its booked window is released.
     Mirrors :func:`find_overlapping`'s strict half-open inequalities (visits
     that merely touch the window edges never constrain it), but returns all
     rows — the planner needs every boundary inside the span to reconstruct
@@ -322,9 +324,10 @@ def get_active_reservation_windows(
     return [
         (row["start_utc"], row["end_utc"])
         for row in cur.execute(
-            "SELECT start_utc, end_utc FROM reservations "
+            "SELECT start_utc, COALESCE(checked_out_at, end_utc) AS end_utc "
+            "FROM reservations "
             "WHERE point_id = %s AND status = 'active' "
-            "AND start_utc < %s AND end_utc > %s "
+            "AND start_utc < %s AND COALESCE(checked_out_at, end_utc) > %s "
             "UNION ALL "
             "SELECT start_utc, end_utc FROM slot_locks "
             "WHERE point_id = %s AND status = 'locked' AND expires_at > %s "
@@ -350,7 +353,8 @@ def get_active_reservation_windows(
 _RESERVATION_COLS = (
     "id, point_id, idempotency_key, start_utc, end_utc, rules_version, "
     "cancel_token, status, revision, created_start_utc, created_end_utc, "
-    "created_rules_version, created_at, cancelled_at"
+    "created_rules_version, created_at, cancelled_at, checked_in_at, "
+    "checked_out_at"
 )
 
 _RESCHEDULE_COLS = (
@@ -376,15 +380,22 @@ def get_reservation_by_id(cur: psycopg.Cursor, reservation_id: int) -> dict | No
     ).fetchone()
 
 
-def get_reservation_for_update(
+def find_reservation_for_update(
     cur: psycopg.Cursor, point_id: int, reservation_id: int
-) -> dict:
-    """Lock the reservation row and return it, or raise 404 (cancel semantics)."""
-    row = cur.execute(
+) -> dict | None:
+    """Lock the reservation row (FOR UPDATE) and return it, or None."""
+    return cur.execute(
         f"SELECT {_RESERVATION_COLS} FROM reservations "
         "WHERE id = %s AND point_id = %s FOR UPDATE",
         (reservation_id, point_id),
     ).fetchone()
+
+
+def get_reservation_for_update(
+    cur: psycopg.Cursor, point_id: int, reservation_id: int
+) -> dict:
+    """Lock the reservation row and return it, or raise 404 (cancel semantics)."""
+    row = find_reservation_for_update(cur, point_id, reservation_id)
     if row is None:
         raise ReservationNotFoundError(
             f"reservation {reservation_id} of point {point_id} does not exist",
@@ -440,21 +451,25 @@ def find_overlapping(
     """Active reservations overlapping ``[start_utc, end_utc)``.
 
     Strict inequality on both sides means reservations that merely touch
-    (one ends exactly when the other starts) coexist peacefully.  When
-    rescheduling, the reservation's own row is ignored.
+    (one ends exactly when the other starts) coexist peacefully.  A
+    reservation with a recorded departure only occupies until
+    ``checked_out_at``: its released tail no longer overlaps anything.
+    When rescheduling, the reservation's own row is ignored.
     """
     if exclude_reservation_id is None:
         return cur.execute(
             "SELECT id, start_utc, end_utc FROM reservations "
             "WHERE point_id = %s AND status = 'active' "
-            "AND start_utc < %s AND end_utc > %s ORDER BY id",
+            "AND start_utc < %s AND COALESCE(checked_out_at, end_utc) > %s "
+            "ORDER BY id",
             (point_id, end_utc, start_utc),
         ).fetchall()
     return cur.execute(
         "SELECT id, start_utc, end_utc FROM reservations "
         "WHERE point_id = %s AND status = 'active' "
         "AND id <> %s "
-        "AND start_utc < %s AND end_utc > %s ORDER BY id",
+        "AND start_utc < %s AND COALESCE(checked_out_at, end_utc) > %s "
+        "ORDER BY id",
         (point_id, exclude_reservation_id, end_utc, start_utc),
     ).fetchall()
 
@@ -483,15 +498,19 @@ def _occupancy_source(exclude_reservation_id: int | None) -> str:
     """SQL fragment selecting every ``(start_utc, end_utc)`` occupancy window.
 
     Occupancy = active reservations (optionally excluding one, when
-    rescheduling) plus valid slot locks.  Used as a subquery/CTE by the peak
-    concurrency probes; expects ``%(point_id)s`` and ``%(now)s`` params (and
-    ``%(exclude_id)s`` when an exclusion is requested).
+    rescheduling) plus valid slot locks.  A reservation with a recorded
+    departure occupies only ``[start_utc, checked_out_at)``: the remainder
+    of its booked window was released at check-out.  Used as a
+    subquery/CTE by the peak concurrency probes; expects ``%(point_id)s``
+    and ``%(now)s`` params (and ``%(exclude_id)s`` when an exclusion is
+    requested).
     """
     exclude_clause = ""
     if exclude_reservation_id is not None:
         exclude_clause = "AND id <> %(exclude_id)s"
     return (
-        "SELECT start_utc, end_utc FROM reservations "
+        "SELECT start_utc, COALESCE(checked_out_at, end_utc) AS end_utc "
+        "FROM reservations "
         f"WHERE point_id = %(point_id)s AND status = 'active' {exclude_clause} "
         "UNION ALL "
         "SELECT start_utc, end_utc FROM slot_locks "
@@ -656,6 +675,50 @@ def cancel_reservation(
         (reservation_id,),
     ).fetchone()
     return row, True
+
+
+# ---------------------------------------------------------------------------
+# Check-in / check-out (签到/离场) — server-stamped attendance records
+# ---------------------------------------------------------------------------
+
+def record_checkin(
+    cur: psycopg.Cursor, reservation_id: int, now: datetime
+) -> dict:
+    """Stamp the visitor's arrival exactly once and return the updated row.
+
+    The caller holds the point row lock and the reservation row lock and has
+    verified the token, the status and the check-in window, so the
+    ``checked_in_at IS NULL`` guard can only match on the first request — a
+    repeat check-in never overwrites the first record.
+    """
+    row = cur.execute(
+        "UPDATE reservations SET checked_in_at = %s "
+        f"WHERE id = %s AND checked_in_at IS NULL RETURNING {_RESERVATION_COLS}",
+        (now, reservation_id),
+    ).fetchone()
+    assert row is not None, "reservation was already checked in while locked"
+    return row
+
+
+def record_checkout(
+    cur: psycopg.Cursor, reservation_id: int, now: datetime
+) -> dict:
+    """Stamp the visitor's departure exactly once and return the updated row.
+
+    Recording the departure releases the reservation's remaining occupancy
+    from ``now`` on: every capacity probe counts the reservation over its
+    effective window ``[start_utc, COALESCE(checked_out_at, end_utc))``.  The
+    reservation number, window, revision and cancel token are untouched, and
+    the caller promotes the waitlist into the freed tail in the same
+    transaction while holding the point row lock.
+    """
+    row = cur.execute(
+        "UPDATE reservations SET checked_out_at = %s "
+        f"WHERE id = %s AND checked_out_at IS NULL RETURNING {_RESERVATION_COLS}",
+        (now, reservation_id),
+    ).fetchone()
+    assert row is not None, "reservation was already checked out while locked"
+    return row
 
 
 # ---------------------------------------------------------------------------
@@ -1025,6 +1088,21 @@ def get_lock_for_update(
             details={"point_id": point_id, "lock_id": lock_id},
         )
     return row
+
+
+def find_lock_by_id(
+    cur: psycopg.Cursor, point_id: int, lock_id: int
+) -> dict | None:
+    """Return the slot-lock row for ``(point_id, lock_id)``, or None.
+
+    Used by the check-in / check-out endpoints to give a distinguishable
+    refusal when the presented number names a slot lock that was never
+    confirmed into a reservation, instead of a plain 404.
+    """
+    return cur.execute(
+        f"SELECT {_LOCK_COLS} FROM slot_locks WHERE id = %s AND point_id = %s",
+        (lock_id, point_id),
+    ).fetchone()
 
 
 def check_confirm_token(row: dict, confirm_token: str | None) -> None:

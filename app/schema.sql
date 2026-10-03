@@ -47,6 +47,12 @@ CREATE INDEX IF NOT EXISTS idx_rule_versions_point
 -- ``created_*`` columns are an immutable snapshot of the original creation, so
 -- create-key replays keep returning the first-created window even after the
 -- reservation has been rescheduled.
+-- ``checked_in_at`` / ``checked_out_at`` record the visitor's arrival and
+-- departure (签到/离场).  Both are server-stamped, set exactly once and never
+-- change the reservation number, window, revision or cancel token; a recorded
+-- departure releases the remaining occupancy from that instant on, so capacity
+-- is counted over the effective window [start_utc, COALESCE(checked_out_at,
+-- end_utc)).
 CREATE TABLE IF NOT EXISTS reservations (
     id                     BIGSERIAL PRIMARY KEY,
     point_id               BIGINT NOT NULL REFERENCES points(id) ON DELETE CASCADE,
@@ -63,6 +69,8 @@ CREATE TABLE IF NOT EXISTS reservations (
     created_rules_version  INTEGER NOT NULL,
     created_at             TIMESTAMPTZ NOT NULL DEFAULT now(),
     cancelled_at           TIMESTAMPTZ,
+    checked_in_at          TIMESTAMPTZ,             -- arrival recorded at check-in
+    checked_out_at         TIMESTAMPTZ,             -- departure; tail occupancy freed
     UNIQUE (point_id, idempotency_key)
 );
 
@@ -83,6 +91,13 @@ UPDATE reservations
  WHERE created_start_utc IS NULL
     OR created_end_utc IS NULL
     OR created_rules_version IS NULL;
+
+-- Upgrade path for databases created before check-in / check-out existed:
+-- existing reservations simply have no attendance record (both stay NULL).
+ALTER TABLE reservations
+    ADD COLUMN IF NOT EXISTS checked_in_at TIMESTAMPTZ;
+ALTER TABLE reservations
+    ADD COLUMN IF NOT EXISTS checked_out_at TIMESTAMPTZ;
 
 CREATE INDEX IF NOT EXISTS idx_reservations_point_active
     ON reservations (point_id, start_utc) WHERE status = 'active';

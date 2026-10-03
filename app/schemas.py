@@ -96,6 +96,18 @@ class ReservationCancelIn(BaseModel):
     cancel_token: str | None = None
 
 
+class ReservationCheckinIn(BaseModel):
+    """Check-in (签到) request: the same capability token as cancellation."""
+
+    cancel_token: str | None = None
+
+
+class ReservationCheckoutIn(BaseModel):
+    """Check-out (离场) request: the same capability token as cancellation."""
+
+    cancel_token: str | None = None
+
+
 class ReservationRescheduleIn(BaseModel):
     """Reschedule request: capability token + optimistic revision + new window.
 
@@ -489,6 +501,27 @@ class ReservationStateOut(BaseModel):
     rules_version: int
     created_at: datetime
     cancelled_at: datetime | None
+
+
+class ReservationAttendanceOut(BaseModel):
+    """Result of check-in / check-out (签到/离场): state plus attendance.
+
+    Same public state as :class:`ReservationStateOut` (no cancel token)
+    extended with the server-stamped arrival and departure times.  Kept
+    separate so the shapes of the pre-existing endpoints stay unchanged.
+    """
+
+    id: int
+    point_id: int
+    status: str
+    revision: int
+    start: str
+    end: str
+    rules_version: int
+    created_at: datetime
+    cancelled_at: datetime | None
+    checked_in_at: datetime | None
+    checked_out_at: datetime | None
 
 
 class WaitlistOut(BaseModel):

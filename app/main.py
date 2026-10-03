@@ -17,13 +17,17 @@ from .config import settings
 from .errors import ApiError
 from .errors import (
     CapacityConflictError,
+    CheckinNotAllowedError,
+    CheckoutNotAllowedError,
     IdempotencyConflictError,
     InvalidPeriodError,
     InvalidRequestError,
     InvalidWaitlistTokenError,
     LockExpiredError,
+    LockNotConfirmedError,
     NotFoundError,
     OutsideOpenHoursError,
+    ReservationNotFoundError,
     ReservationNotReschedulableError,
     ReservationOverlapError,
     RevisionConflictError,
@@ -42,7 +46,10 @@ from .schemas import (
     PublishOut,
     PublishRulesIn,
     ReassignOut,
+    ReservationAttendanceOut,
     ReservationCancelIn,
+    ReservationCheckinIn,
+    ReservationCheckoutIn,
     ReservationCreateIn,
     ReservationOut,
     ReservationReassignIn,
@@ -403,6 +410,23 @@ def _reservation_state_out(row: dict) -> ReservationStateOut:
     )
 
 
+def _reservation_attendance_out(row: dict) -> ReservationAttendanceOut:
+    """Check-in / check-out result: the public state plus the attendance."""
+    return ReservationAttendanceOut(
+        id=row["id"],
+        point_id=row["point_id"],
+        status=row["status"],
+        revision=row["revision"],
+        start=utc_iso(row["start_utc"]),
+        end=utc_iso(row["end_utc"]),
+        rules_version=row["rules_version"],
+        created_at=row["created_at"],
+        cancelled_at=row["cancelled_at"],
+        checked_in_at=row["checked_in_at"],
+        checked_out_at=row["checked_out_at"],
+    )
+
+
 def _assert_window_has_capacity(
     cur,
     point: dict,
@@ -595,6 +619,196 @@ def cancel_reservation(
     return _reservation_state_out(row)
 
 
+# ---------------------------------------------------------------------------
+# Check-in / check-out (签到/离场) — attendance against the booked window
+# ---------------------------------------------------------------------------
+
+def _reservation_or_lock_refusal(
+    cur, point_id: int, reservation_id: int
+) -> None:
+    """Raise the distinguishable refusal for an unknown reservation number.
+
+    A number that names a slot lock which was never confirmed into a
+    reservation is refused with ``409 lock_not_confirmed`` (a lock holds no
+    visit yet, so there is nothing to check in or out of); anything else is
+    the ordinary ``404 reservation_not_found``.
+    """
+    lock = db.find_lock_by_id(cur, point_id, reservation_id)
+    if lock is not None and lock["reservation_id"] is None:
+        raise LockNotConfirmedError(
+            f"number {reservation_id} of point {point_id} is a slot lock that "
+            f"has not been confirmed into a reservation; confirm the lock "
+            f"first — check-in/check-out apply to reservations",
+            details={
+                "point_id": point_id,
+                "lock_id": lock["id"],
+                "lock_status": lock["status"],
+            },
+        )
+    raise ReservationNotFoundError(
+        f"reservation {reservation_id} of point {point_id} does not exist",
+        details={"point_id": point_id, "reservation_id": reservation_id},
+    )
+
+
+@app.post(
+    "/points/{point_id}/reservations/{reservation_id}/checkin",
+    response_model=ReservationAttendanceOut,
+    tags=["reservations"],
+)
+def checkin_reservation(
+    point_id: int, reservation_id: int, body: ReservationCheckinIn
+) -> ReservationAttendanceOut:
+    """Record the visitor's arrival (签到) against a valid reservation.
+
+    Check-in is accepted inside ``[start - CHECKIN_EARLY_MINUTES, end)``
+    (15 minutes before the start, inclusive, up to the end, exclusive, by
+    default) and stamps the server-side arrival time.  A repeat check-in of
+    a still-valid reservation replays the first record; a wrong token, a
+    cancelled reservation or an unconfirmed slot lock is refused.
+    """
+    now = datetime.now(timezone.utc)
+    with db.conn() as connection:
+        with connection.transaction():
+            cur = connection.cursor()
+            # Same per-point lock order as every other mutation, so the
+            # attendance record serializes with cancels and reschedules.
+            db.lock_point(cur, point_id)
+            resv = db.find_reservation_for_update(cur, point_id, reservation_id)
+            if resv is None:
+                _reservation_or_lock_refusal(cur, point_id, reservation_id)
+            # 404 / 403 semantics mirror the cancel endpoint: existence
+            # first, then the capability token.
+            db.check_cancel_token(resv, body.cancel_token)
+            if resv["status"] == "cancelled":
+                raise CheckinNotAllowedError(
+                    f"reservation {reservation_id} is cancelled and cannot be "
+                    f"checked in",
+                    details={
+                        "reservation_id": reservation_id,
+                        "status": "cancelled",
+                        "reason": "reservation_cancelled",
+                    },
+                )
+            if resv["checked_in_at"] is not None:
+                # Repeat check-in of a valid reservation: replay the first
+                # recorded arrival (the record is never overwritten).
+                return _reservation_attendance_out(resv)
+            opens_at = resv["start_utc"] - timedelta(
+                minutes=settings.checkin_early_minutes
+            )
+            if now < opens_at:
+                raise CheckinNotAllowedError(
+                    f"check-in for reservation {reservation_id} opens at "
+                    f"{utc_iso(opens_at)} "
+                    f"({settings.checkin_early_minutes} minutes before its "
+                    f"start)",
+                    details={
+                        "reservation_id": reservation_id,
+                        "reason": "too_early",
+                        "checkin_opens_at": utc_iso(opens_at),
+                        "start": utc_iso(resv["start_utc"]),
+                        "now": utc_iso(now),
+                    },
+                )
+            if now >= resv["end_utc"]:
+                raise CheckinNotAllowedError(
+                    f"reservation {reservation_id} ended at "
+                    f"{utc_iso(resv['end_utc'])} and can no longer be "
+                    f"checked in",
+                    details={
+                        "reservation_id": reservation_id,
+                        "reason": "already_ended",
+                        "end": utc_iso(resv["end_utc"]),
+                        "now": utc_iso(now),
+                    },
+                )
+            row = db.record_checkin(cur, reservation_id, now)
+            return _reservation_attendance_out(row)
+
+
+@app.post(
+    "/points/{point_id}/reservations/{reservation_id}/checkout",
+    response_model=ReservationAttendanceOut,
+    tags=["reservations"],
+)
+def checkout_reservation(
+    point_id: int, reservation_id: int, body: ReservationCheckoutIn
+) -> ReservationAttendanceOut:
+    """Record the visitor's departure (离场) and free the rest of the window.
+
+    A checked-in visitor may check out inside ``[start, end)`` with the same
+    capability token; the server stamps the departure time and releases the
+    remaining occupancy from that instant, promoting fitting waitlist
+    entries in the same transaction.  A repeat check-out replays the first
+    record; a wrong token is always refused, and a first check-out without
+    a check-in or after the window's end is refused.
+    """
+    now = datetime.now(timezone.utc)
+    with db.conn() as connection:
+        with connection.transaction():
+            cur = connection.cursor()
+            # Same per-point lock as every other capacity decision: the
+            # departure record, the occupancy release and the waitlist
+            # promotion serialize against concurrent bookings, so a
+            # concurrent departure and allocation can never double-book.
+            point = db.lock_point(cur, point_id)
+            resv = db.find_reservation_for_update(cur, point_id, reservation_id)
+            if resv is None:
+                _reservation_or_lock_refusal(cur, point_id, reservation_id)
+            # A wrong token is always refused — even when the departure was
+            # already recorded.
+            db.check_cancel_token(resv, body.cancel_token)
+            if resv["checked_out_at"] is not None:
+                # Repeat check-out with the valid token: replay the first
+                # recorded departure (the record is never overwritten).
+                return _reservation_attendance_out(resv)
+            if resv["checked_in_at"] is None:
+                raise CheckoutNotAllowedError(
+                    f"reservation {reservation_id} has not checked in and "
+                    f"cannot be checked out",
+                    details={
+                        "reservation_id": reservation_id,
+                        "reason": "not_checked_in",
+                    },
+                )
+            if now < resv["start_utc"]:
+                raise CheckoutNotAllowedError(
+                    f"reservation {reservation_id} starts at "
+                    f"{utc_iso(resv['start_utc'])}; check-out is possible "
+                    f"from the start of the visit on",
+                    details={
+                        "reservation_id": reservation_id,
+                        "reason": "too_early",
+                        "start": utc_iso(resv["start_utc"]),
+                        "now": utc_iso(now),
+                    },
+                )
+            if now >= resv["end_utc"]:
+                raise CheckoutNotAllowedError(
+                    f"reservation {reservation_id} ended at "
+                    f"{utc_iso(resv['end_utc'])} and can no longer be "
+                    f"checked out",
+                    details={
+                        "reservation_id": reservation_id,
+                        "reason": "already_ended",
+                        "end": utc_iso(resv["end_utc"]),
+                        "now": utc_iso(now),
+                    },
+                )
+            # Capacity-touching write: expire due locks first and promote the
+            # waitlist into the freed slots, in application order.
+            _sweep_expired_locks(cur, point, now)
+            row = db.record_checkout(cur, reservation_id, now)
+            # The departure frees the rest of the booked window from this
+            # instant on: in the same transaction, promote every waitlist
+            # entry that now fits, in application order.  A failure here
+            # rolls the check-out back together with the sweep.
+            _, rules_row = db.get_current_rules(cur, point_id)
+            db.promote_waitlist(cur, point, rules_row, now)
+            return _reservation_attendance_out(row)
+
+
 def _reschedule_replay_out(reservation: dict, attempt: dict) -> ReservationOut:
     """Build the response of a successful reschedule attempt on replay.
 
@@ -671,6 +885,19 @@ def reschedule_reservation(
                         "reservation_id": reservation_id,
                         "status": "cancelled",
                         "reason": "reservation_cancelled",
+                    },
+                )
+            if resv["checked_in_at"] is not None:
+                # A checked-in visit is being (or has been) consumed: its
+                # window can no longer be moved, even before the start.
+                raise ReservationNotReschedulableError(
+                    f"reservation {reservation_id} has checked in and cannot "
+                    f"be rescheduled",
+                    details={
+                        "reservation_id": reservation_id,
+                        "status": resv["status"],
+                        "reason": "reservation_checked_in",
+                        "checked_in_at": utc_iso(resv["checked_in_at"]),
                     },
                 )
             if resv["start_utc"] <= now:
@@ -856,6 +1083,19 @@ def reassign_reservation(
                         "reservation_id": reservation_id,
                         "status": "cancelled",
                         "reason": "reservation_cancelled",
+                    },
+                )
+            if resv["checked_in_at"] is not None:
+                # A checked-in visit is being (or has been) consumed: it can
+                # no longer be moved to another point, even before the start.
+                raise ReservationNotReschedulableError(
+                    f"reservation {reservation_id} has checked in and cannot "
+                    f"be reassigned",
+                    details={
+                        "reservation_id": reservation_id,
+                        "status": resv["status"],
+                        "reason": "reservation_checked_in",
+                        "checked_in_at": utc_iso(resv["checked_in_at"]),
                     },
                 )
             if resv["start_utc"] <= now:

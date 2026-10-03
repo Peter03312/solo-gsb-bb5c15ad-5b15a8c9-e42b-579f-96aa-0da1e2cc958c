@@ -685,3 +685,63 @@ api POST "/points/$LPID/reservations" "{
 # Note: a lock left unconfirmed past its expires_at deadline (10 minutes by
 # default) stops occupying; confirming it then fails with 409 lock_expired,
 # and the next capacity-touching write sweeps it and promotes the waitlist.
+
+echo
+echo "== 13. Check-in / check-out (签到/离场): arrival and departure records =="
+# A dedicated point whose weekly rules cover every wall-clock minute (24/7),
+# so a visit starting minutes from now is always inside the open hours.
+CPOINT_JSON="$(api POST /points '{"name":"签到演示点","timezone":"UTC"}')"
+echo "$CPOINT_JSON"
+CPID="$(echo "$CPOINT_JSON" | sed -n 's/.*"id":\([0-9]*\).*/\1/p')"
+WEEKLY=""
+for DOW in 1 2 3 4 5 6 7; do
+  WEEKLY="${WEEKLY}{\"weekday\":$DOW,\"start_time\":\"00:00\",\"end_time\":\"23:59\"},"
+  WEEKLY="${WEEKLY}{\"weekday\":$DOW,\"start_time\":\"23:00\",\"end_time\":\"02:00\"},"
+done
+api POST "/points/$CPID/rules" "{
+  \"expected_version\": 0,
+  \"rules\": {\"weekly\": [${WEEKLY%,}], \"closed_dates\": [], \"makeup\": []}
+}"
+
+echo
+echo "-- book a visit starting 10 minutes from now (check-in opens 15 min ahead) --"
+CSTART="$(date -u -d '+10 min' +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || date -u -v+10M +%Y-%m-%dT%H:%M:%SZ)"
+CEND="$(date -u -d '+70 min' +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || date -u -v+70M +%Y-%m-%dT%H:%M:%SZ)"
+CRES_JSON="$(api POST "/points/$CPID/reservations" "{
+  \"idempotency_key\": \"demo-checkin-1\",
+  \"start\": \"$CSTART\",
+  \"end\": \"$CEND\"
+}")"
+echo "$CRES_JSON"
+CRID="$(echo "$CRES_JSON" | sed -n 's/.*"id":\([0-9]*\).*/\1/p')"
+CTOKEN="$(echo "$CRES_JSON" | sed -n 's/.*"cancel_token":"\([^"]*\)".*/\1/p')"
+
+echo
+echo "-- check in now (inside [start-15min, end)): 200 with checked_in_at --"
+api POST "/points/$CPID/reservations/$CRID/checkin" "{\"cancel_token\":\"$CTOKEN\"}"
+
+echo
+echo "-- a repeat check-in replays the first record (same checked_in_at) --"
+api POST "/points/$CPID/reservations/$CRID/checkin" "{\"cancel_token\":\"$CTOKEN\"}"
+
+echo
+echo "-- a wrong token is refused (403 invalid_cancel_token) --"
+api POST "/points/$CPID/reservations/$CRID/checkin" '{"cancel_token":"wrong"}'
+
+echo
+echo "-- before the start, check-out is refused (409 checkout_not_allowed / too_early) --"
+api POST "/points/$CPID/reservations/$CRID/checkout" "{\"cancel_token\":\"$CTOKEN\"}"
+
+echo
+echo "-- a checked-in visit cannot be rescheduled (409 reservation_checked_in) --"
+api POST "/points/$CPID/reservations/$CRID/reschedule" "{
+  \"cancel_token\": \"$CTOKEN\",
+  \"idempotency_key\": \"demo-checkin-move\",
+  \"expected_revision\": 1,
+  \"start\": \"$CSTART\",
+  \"end\": \"$CEND\"
+}"
+# Once the start arrives (up to the end, exclusive), the same checkout call
+# records checked_out_at, releases the rest of the window from that instant
+# and promotes the waitlist in the same transaction; a repeat checkout
+# replays the first record, and a wrong token is always refused (403).
